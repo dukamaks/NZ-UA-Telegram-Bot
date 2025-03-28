@@ -3,21 +3,29 @@ import os
 from aiogram import Bot, Dispatcher, F
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile, InputFile, URLInputFile, FSInputFile
 from aiogram.filters.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import default_state
 from babel.dates import format_date
+import numpy as np
+import pandas as pd
+from matplotlib.table import Table
 import re
 import html
+import aiohttp
+import tempfile
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance
+import io
 from logger import logging
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from database import User
 
 load_dotenv()
 
 bot = Bot(os.getenv('TOKEN'))
 dp = Dispatcher()
-
+scheduler = AsyncIOScheduler()
 
 class AuthStates(StatesGroup):
     login = State()
@@ -86,25 +94,26 @@ async def get_password(message: Message, state: FSMContext):
     password = message.text
     logging.debug(f"{message.from_user.id} | Приняли пароль")
 
-
     try:
-        user = User.create(id=message.from_user.id)
-        user.credentials(login, password)
-        print(user.get_new_grades())
-        markup = ReplyKeyboardMarkup(keyboard=[
-                [KeyboardButton(text='📖 Дневник'), KeyboardButton(text='📅 Расписание')], 
+        async with aiohttp.ClientSession() as session:
+            user: User = User.create(id=message.from_user.id)
+            await user.credentials(login, password, session)
+            print(await user.get_new_grades(session))
+            markup = ReplyKeyboardMarkup(keyboard=[
+                [KeyboardButton(text='📖 Дневник'), KeyboardButton(text='📅 Расписание')],
                 [KeyboardButton(text='📊 Успеваемость'), KeyboardButton(text='❌ Пропущенные уроки')],
                 [KeyboardButton(text='👤 Профиль')]
             ], resize_keyboard=True)
 
-        await message.reply(f'✅ Авторизация успешна, {user.FIO}!', reply_markup=markup)
-        await message.delete()
-        logging.success(f"{message.from_user.id} | {user.FIO} | Авторизация успешна")
-        await state.clear()
+            await message.reply(f'✅ Авторизация успешна, {user.FIO}!', reply_markup=markup)
+            await message.delete()
+            logging.success(f"{message.from_user.id} | {user.FIO} | Авторизация успешна")
+            await state.clear()
 
     except Exception as e:
         await message.reply(f'❌ Ошибка авторизации: {e}. Попробуйте еще раз. /start')
         logging.error(f"{message.from_user.id} | {e} Ошибка авторизации")
+        user.delete_instance()
         await state.clear()
 
 @dp.message(F.text == '📖 Дневник')
@@ -136,7 +145,9 @@ async def process_diary_date(callback_query: CallbackQuery, state: FSMContext):
     user = User.get_or_none(id=callback_query.from_user.id)
     if user:
         date_str = callback_query.data.split(":")[1]
-        diary = user._fetch_diary([date_str])
+        async with aiohttp.ClientSession() as session:
+            await user._check_token_expire(session)
+            diary = await user._fetch_data('http://api-mobile.nz.ua/v1/schedule/diary', [date_str], session)
         data = await state.get_data()
         original_message_id = data.get('original_message_id')
         if diary and diary.get('dates'):
@@ -197,7 +208,9 @@ async def timetable(message: Message):
         start_of_week = today - timedelta(days=today.weekday())
         end_of_week = start_of_week + timedelta(days=6)
         dates = [start_of_week.strftime("%Y-%m-%d"), end_of_week.strftime("%Y-%m-%d")]
-        diary_data = user._fetch_timetable(dates)
+        async with aiohttp.ClientSession() as session:
+            await user._check_token_expire(session)
+            diary_data = await user._fetch_data('http://api-mobile.nz.ua/v1/schedule/timetable', dates, session)
 
         if diary_data and diary_data.get('dates'):
             timetable_html = "📅 <b>Расписание на неделю:</b> ✨\n\n"
@@ -232,14 +245,18 @@ async def timetable(message: Message):
 
 @dp.message(F.text == '📊 Успеваемость')
 async def student_performance(message: Message):
-    user = User.get_or_none(id=message.from_user.id)
+    user: User = User.get_or_none(id=message.from_user.id)
     if user:
         today = datetime.now()
         start_date = today.replace(day=1).strftime("%Y-%m-%d")
         end_date = today.strftime("%Y-%m-%d")
-
         try:
-            performance_data = user._fetch_student_performance([start_date, end_date])
+            async with aiohttp.ClientSession() as session:
+                    await user._check_token_expire(session)
+                    performance_data = await user._fetch_data(
+                        'http://api-mobile.nz.ua/v1/schedule/student-performance',
+                        [start_date, end_date], session
+                    )
 
             if performance_data and performance_data.get('subjects'):
                 performance_html = "📊 <b>Успеваемость за текущий месяц:</b>\n\n"
@@ -261,14 +278,23 @@ async def student_performance(message: Message):
                     missed_lessons = performance_data['missed'].get('lessons', 0)
                     performance_html += f"\n<b>Пропущено дней:</b> {missed_days}\n"
                     performance_html += f"<b>Пропущено уроков:</b> {missed_lessons}\n"
+                image = user.generate_image()
 
-                await message.reply(performance_html, parse_mode="HTML")
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+                    temp_file.write(image)
+                    temp_file_name = temp_file.name
+                logging.debug(temp_file_name)
+                photo = FSInputFile(temp_file_name, filename='performance_img.png')
+                await message.answer_photo(photo, caption=performance_html, parse_mode="HTML")
+
+                os.remove(temp_file_name)
+
                 logging.success(f'{message.from_user.id} | {user.FIO} | Вывод успеваемости')
 
             else:
                 await message.reply("Данные об успеваемости за этот месяц пока недоступны.")
 
-        except Exception as e: # other exceptions
+        except Exception as e:
             logging.exception(f"An unexpected error occurred: {e}")
             await message.reply(f"Произошла непредвиденная ошибка: {e}")
 
@@ -276,7 +302,7 @@ async def student_performance(message: Message):
         await message.reply("Сначала необходимо авторизоваться. /start")
 marks2emoji = {
     1: "💩",
-    2: "🤓",
+    2: "💅",
     3: "☠️",
     4: "✨",
     5: "🤡",
@@ -289,57 +315,73 @@ marks2emoji = {
     12: "😎",
 }
 
-async def my_background_task():
-    while True:
-        users:list[User] = User.select().where(User.token_expired != None)
-        for user in users:
-            marks = user.get_new_grades()
+# ...
 
-            logging.debug(f"{user.FIO} - {marks}")
-            if marks is None:
-                continue
-            if marks['new_grades']:
-                for grade in marks['new_grades']:
-                    mark_emoji = marks2emoji.get(int(grade['mark']), "")
+async def background_task():
+    async with aiohttp.ClientSession() as session:
+        while True:
+            time_all = datetime.now()
+            users = list(User.select().where(User.token_expired != None))
+            
+            for user in users:
+                try:
+                    time_user = datetime.now()
+                    
+                    marks = await user.get_new_grades(session)
+                    logging.success(marks)
+                    if not marks or not marks['new_grades']:
+                        continue
+                    
+                    for grade in marks['new_grades']:
+                        emoji = marks2emoji[int(grade['mark'])]
+                        message = (
+                            f"{emoji} *Новая оценка!* {emoji}\n\n"
+                            f"*Оценка:* {grade['mark']}\n"
+                            f"*Предмет:* {grade['subject']} ({grade['lesson_type']})\n"
+                            f"*Дата:* {grade['lesson_date']}\n"
+                        )
+                        
+                        if grade['comment']:
+                            message += f"*Комментарий:* {markdown_protect(grade['comment'])}\n"
+                        
+                        try:
+                            await bot.send_message(user.id, message, parse_mode="Markdown")
+                            logging.info(f"{user.FIO} Новая оценка {grade['mark']} | {grade['subject']}")
+                        except Exception as e:
+                            logging.error(f"Ошибка отправки сообщения пользователю {user.FIO}: {e}")
+                    
+                    if marks['updated_grades']:
+                        for grade_data in marks['updated_grades']:
+                            new_grade = grade_data['new']
+                            old_grade = grade_data['old']
+                            
+                            emoji = marks2emoji[int(new_grade['mark'])]
+                            message = (
+                                f"{emoji} *Изменение оценки!* {emoji}\n\n"
+                                f"*Предмет:* {new_grade['subject']} ({new_grade['lesson_type']})\n"
+                                f"*Дата:* {new_grade['lesson_date']}\n"
+                                f"*Оценка:* {old_grade['mark']} -> {new_grade['mark']}\n"
+                            )
+                            
+                            if old_grade['comment']:
+                                message += f"*Старый комментарий:* {markdown_protect(old_grade['comment'])}\n"
+                            if new_grade['comment']:
+                                message += f"*Новый комментарий:* {markdown_protect(new_grade['comment'])}\n"
+                            
+                            try:
+                                await bot.send_message(user.id, message, parse_mode="Markdown")
+                                logging.info(f"{user.FIO} Изменение оценки {old_grade['mark']} -> {new_grade['mark']} | {new_grade['subject']}")
+                            except Exception as e:
+                                logging.error(f"Ошибка отправки сообщения пользователю {user.FIO}: {e}")
+                
+                except Exception as e:
+                    logging.exception(f"Ошибка в цикле: {e}. Продолжаем работу")
+                finally:
+                    logging.debug(f"	{user.FIO} - ({datetime.now() - time_user}) {marks if marks else None}")
+            
+            logging.info(f'Время цикла: {datetime.now() - time_all}')
+            await asyncio.sleep(60)
 
-                    message = (
-                        f"{mark_emoji} *Новая оценка!* {mark_emoji}\n\n"
-                        f"*Оценка:* {grade['mark']}\n"
-                        f"*Предмет:* {grade['subject']} ({grade['lesson_type']})\n"
-                        f"*Дата:* {grade['lesson_date']}\n"
-                    )
-                    if grade['comment']:
-                        message += f"*Комментарий:* {markdown_protect(grade['comment'])}\n"
-                    try:
-                        await bot.send_message(user.id, message, parse_mode="Markdown") 
-                        logging.success(f"{user.FIO} Новая оценка {grade['mark']} | {grade['subject']}")
-                    except Exception as e:
-                        logging.error(f"Ошибка отправки сообщения пользователю {user.FIO}: {e}")
-            if marks['updated_grades']:
-                for grade_data in marks['updated_grades']:
-                    new_grade = grade_data['new']
-                    old_grade = grade_data['old']
-
-                    mark_emoji = marks2emoji.get(int(new_grade['mark']), "")
-                    message = (
-                        f"{mark_emoji} *Изменение оценки!* {mark_emoji}\n\n"
-                        f"*Предмет:* {new_grade['subject']} ({new_grade['lesson_type']})\n"
-                        f"*Дата:* {new_grade['lesson_date']}\n"
-                        f"*Оценка:* {old_grade['mark']} -> {new_grade['mark']}\n"
-                    )
-
-                    if new_grade['comment'] != old_grade['comment']:
-                        message += f"*Старый комментарий:* {markdown_protect(old_grade['comment']) if old_grade['comment'] else '—'}\n"
-                        message += f"*Новый комментарий:* {markdown_protect(new_grade['comment']) if new_grade['comment'] else '—'}\n"
-
-                    try:
-                        await bot.send_message(user.id, message, parse_mode="Markdown")
-                        logging.success(f"{user.FIO} Изменение оценки {old_grade['mark']} -> {new_grade['mark']} | {new_grade['subject']}")
-                    except Exception as e:
-                        logging.error(f"Ошибка отправки сообщения пользователю {user.FIO}: {e}")
-
-
-        await asyncio.sleep(60)
 
 @dp.message(F.text == '❌ Пропущенные уроки')
 async def missed_lessons(message: Message):
@@ -351,7 +393,8 @@ async def missed_lessons(message: Message):
         dates = [start_of_month.strftime("%Y-%m-%d"), end_of_month.strftime("%Y-%m-%d")]
 
         try:
-            missed_lessons_data = user._fetch_missed_lessons(dates)
+            async with aiohttp.ClientSession() as session:
+                missed_lessons_data = await user._fetch_data('http://api-mobile.nz.ua/v1/schedule/missed-lessons', dates, session)
 
             if missed_lessons_data and missed_lessons_data.get('missed_lessons'):
                 missed_lessons_html = "❌ <b>Пропущенные уроки за месяц:</b>\n\n"
@@ -393,7 +436,7 @@ async def profile(message: Message):
             [InlineKeyboardButton(text="✖️ Выйти из аккаунта", callback_data="logout")]
         ])
 
-        await message.reply(profile_info, parse_mode="Markdown", reply_markup=markup)
+        topin = await message.reply(profile_info, parse_mode="Markdown", reply_markup=markup)
         logging.success(f'{message.from_user.id} | {user.FIO} | Вывод профиля')
 
     else:
@@ -413,10 +456,90 @@ async def logout(callback_query: CallbackQuery):
         await callback_query.answer("Вы не авторизованы.")
 
 
+async def send_tomorrow_homework(user: User, session, callback_query: CallbackQuery = None):
+    message_id = callback_query.message.message_id if callback_query else None
 
+    tomorrow = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    try:
+        diary = await user._fetch_data("http://api-mobile.nz.ua/v1/schedule/diary", [tomorrow], session)
+
+        if diary and diary.get('dates'):
+            date_data = diary['dates'][0]
+            calls = date_data['calls']
+
+            homework_message = f"📅 <b>Домашнее задание на {tomorrow}:</b>\n\n"
+
+            for call in calls:
+                for subject in call['subjects']:
+                    if subject['hometask']:
+                        homework_message += f"<b>{call['call_number']}. {html.escape(subject['subject_name'])}:</b>\n"
+                        for task in subject['hometask']:
+                            homework_message += f"• {html.escape(task)}\n"
+
+            markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить данные", callback_data=f"refresh_homework:{tomorrow}")]
+            ])
+
+            try:
+                if message_id:
+                    await bot.edit_message_text(
+                        homework_message, chat_id=user.id, message_id=message_id,
+                        parse_mode="HTML", reply_markup=markup
+                    )
+                    logging.info(f'{user.id} | {user.FIO} | Домашнее задание на завтра обновлено')
+
+                else:
+                    await bot.send_message(
+                        user.id, homework_message, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True
+                    )
+                    logging.info(f'{user.id} | {user.FIO} | Домашнее задание на завтра отправлено')
+
+            except Exception as e:
+                if "message is not modified" in str(e):
+                    if callback_query: 
+                       await bot.answer_callback_query(callback_query.id, "Данные актуальны")
+                    logging.info(f'{user.id} | {user.FIO} | Данные по домашнему заданию актуальны')
+                else:
+                    raise e
+
+        else:
+            not_found_message = f"На завтра ({tomorrow}) домашнее задание не найдено."
+            if message_id:
+                await bot.edit_message_text(not_found_message, chat_id=user.id, message_id=message_id)
+            else:
+                await bot.send_message(user.id, not_found_message)
+
+    except Exception as e:
+        logging.exception(f"Ошибка при отправке домашнего задания: {e}")
+        await bot.send_message(user.id, "Произошла ошибка при получении домашнего задания.")
+
+
+
+async def scheduled_homework_task():
+    for user in User.select().where(User.token_expired != None):
+        async with aiohttp.ClientSession() as session:
+            await send_tomorrow_homework(user, session)
+
+
+
+
+@dp.callback_query(F.data.startswith('refresh_homework:'))
+async def refresh_homework(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    user = User.get_or_none(id=user_id)
+    if user:
+        await send_tomorrow_homework(user, callback_query=callback_query)
+    else:
+        await bot.send_message(user_id, "Пользователь не найден. Попробуйте авторизоваться снова. /start")
 async def main():
-    background_task = asyncio.create_task(my_background_task())
+    asyncio.create_task(background_task())
+    
+
+    scheduler.add_job(scheduled_homework_task, 'cron', hour=11, minute=0)
+    scheduler.start()
     await dp.start_polling(bot)
 
+    
 if __name__ == '__main__':
     asyncio.run(main())
